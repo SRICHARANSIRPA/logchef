@@ -2,7 +2,7 @@
 FROM golang:1.24.2-bullseye AS builder
 
 # Declare build arguments
-ARG APP_VERSION=unknown
+ARG APP_VERSION="1.0"
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 
@@ -63,7 +63,7 @@ RUN sqlc generate
 # RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
 #     cd frontend && pnpm build
 
-cd frontend && pnpm build
+RUN cd frontend && pnpm build
 
 # Set GOCACHE location for build caching
 ENV GOCACHE=/root/.cache/go-build
