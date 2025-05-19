@@ -36,35 +36,47 @@ RUN wget -qO /tmp/sqlc.tar.gz https://downloads.sqlc.dev/sqlc_${SQLC_VERSION}_li
 # Set working directory
 WORKDIR /app
 
-# Download Go dependencies using cache mount
-RUN --mount=type=bind,source=go.mod,target=go.mod \
-    --mount=type=bind,source=go.sum,target=go.sum \
-    --mount=type=cache,target=/go/pkg/mod \
-    go mod download
-
-# Install frontend dependencies using cache mounts
-RUN --mount=type=bind,source=frontend/package.json,target=frontend/package.json \
-    --mount=type=bind,source=frontend/pnpm-lock.yaml,target=frontend/pnpm-lock.yaml \
-    --mount=type=cache,target=/root/.local/share/pnpm/store \
-    cd frontend && pnpm install --frozen-lockfile
-
 # Copy all files
 COPY . .
+
+# Download Go dependencies using cache mount
+# RUN --mount=type=bind,source=go.mod,target=go.mod \
+#     --mount=type=bind,source=go.sum,target=go.sum \
+#     --mount=type=cache,target=/go/pkg/mod \
+#     go mod download
+RUN go mod download
+
+
+# Install frontend dependencies using cache mounts
+# RUN --mount=type=bind,source=frontend/package.json,target=frontend/package.json \
+#     --mount=type=bind,source=frontend/pnpm-lock.yaml,target=frontend/pnpm-lock.yaml \
+#     --mount=type=cache,target=/root/.local/share/pnpm/store \
+#     cd frontend && pnpm install --frozen-lockfile
+RUN cd frontend && pnpm install --frozen-lockfile
+
+
 
 # Generate sqlc code
 RUN sqlc generate
 
 # Build frontend with cache
-RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
-    cd frontend && pnpm build
+# RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
+#     cd frontend && pnpm build
+
+cd frontend && pnpm build
 
 # Set GOCACHE location for build caching
 ENV GOCACHE=/root/.cache/go-build
 
 # Build backend with cache mounts
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+# RUN --mount=type=cache,target=/go/pkg/mod \
+#     --mount=type=cache,target=/root/.cache/go-build \
+#     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+#     -ldflags="-s -w -X 'main.buildString=${APP_VERSION}'" \
+#     -o bin/logchef.bin \
+#     ./cmd/server
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w -X 'main.buildString=${APP_VERSION}'" \
     -o bin/logchef.bin \
     ./cmd/server
