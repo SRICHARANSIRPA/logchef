@@ -1614,7 +1614,31 @@ onBeforeUnmount(() => {
               </div>
             </div>
 
-            
+            <!-- Log Histogram Visualization with Group By -->
+            <div
+              class="px-4 pb-3 "
+              style="display: none;"
+              v-if="
+                !isChangingContext &&
+                currentSourceId &&
+                hasValidSource &&
+                exploreStore.timeRange
+              "
+            >
+              <!-- Group By controls above histogram -->
+              <div class="flex items-center justify-between mb-2">
+                <div class="text-xs font-medium">Time Series Distribution</div>
+                <GroupBySelector :available-fields="availableFields" />
+              </div>
+
+              <!-- Histogram visualization -->
+              <HistogramVisualization
+                :group-by="exploreStore.groupByField"
+                @zoom-time-range="onHistogramTimeRangeZoom"
+                @update:timeRange="onHistogramTimeRangeZoom"
+              />
+            </div>
+
             <!-- Results Section -->
             <div class="flex-1 overflow-hidden flex flex-col border-t mt-2">
               <!-- Results Area -->
