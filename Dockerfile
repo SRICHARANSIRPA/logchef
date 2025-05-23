@@ -93,7 +93,7 @@ WORKDIR /app
 COPY --from=builder /app/bin/logchef.bin .
 
 # Copy the default config file
-COPY config.toml .
+# COPY config.toml .
 
 # Expose the application port (update if necessary based on config.toml)
 EXPOSE 8125
