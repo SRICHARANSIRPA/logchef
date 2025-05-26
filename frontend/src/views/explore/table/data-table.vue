@@ -780,7 +780,7 @@ const handleDrillDown = (columnName: string, value: any, operator: string = '=')
                                             maxWidth: `${cell.column.columnDef.maxSize ?? defaultColumn.maxSize}px`
                                         }">
                                         <div class="flex items-center justify-between gap-1 w-full overflow-hidden">
-                                            <div class="whitespace-pre flex-grow min-w-0 overflow-hidden"
+                                            <div class="flex-grow min-w-0 overflow-hidden"
                                                 :title="formatCellValue(cell.getValue())">
                                                 <FlexRender v-if="cell.column.columnDef.cell"
                                                     :render="cell.column.columnDef.cell" :props="cell.getContext()" />
