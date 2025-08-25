@@ -24,6 +24,19 @@ export interface FilterCondition {
   value: string;
 }
 
+// AI Query generation types
+export interface AIGenerateSQLRequest {
+  natural_language_query: string;
+  current_query?: string; // Optional current query for context
+}
+
+export interface AIGenerateSQLResponse {
+  sql_query: string;
+}
+
+// Add APIErrorResponse for proper type checking
+import type { APIErrorResponse } from "./types";
+
 export interface ColumnInfo {
   name: string;
   type: string;
@@ -36,6 +49,9 @@ export interface QueryParams {
   window?: string;
   group_by?: string;
   timezone?: string; // User's timezone identifier (e.g., 'America/New_York', 'UTC')
+  start_time?: string; // ISO formatted start time
+  end_time?: string;   // ISO formatted end time
+  query_timeout?: number; // Query timeout in seconds
 }
 
 export interface QueryStats {
@@ -45,12 +61,14 @@ export interface QueryStats {
 }
 
 export interface QuerySuccessResponse {
-  logs: Record<string, any>[] | null;
+  logs?: Record<string, any>[] | null; // For backward compatibility
+  data?: Record<string, any>[] | null; // New structure
   stats: QueryStats;
   params?: QueryParams & {
     source_id: number;
   };
   columns: ColumnInfo[];
+  query_id?: string; // Add query_id for cancellation
 }
 
 export interface QueryErrorResponse {
@@ -97,8 +115,9 @@ export function prepareQueryParams(params: {
   window?: string;
   groupBy?: string;
   timezone?: string;
+  queryTimeout?: number;
 }): QueryParams {
-  const { query, limit = 100, window, groupBy, timezone } = params;
+  const { query, limit = 100, window, groupBy, timezone, queryTimeout } = params;
 
   // Use the raw SQL value as is - SQL transformation should happen before calling this function
   return {
@@ -106,22 +125,28 @@ export function prepareQueryParams(params: {
     limit,
     window,
     group_by: groupBy,
-    timezone
+    timezone,
+    query_timeout: queryTimeout
   };
 }
 
 export const exploreApi = {
-  getLogs: (sourceId: number, params: QueryParams, teamId: number) => {
+  getLogs: (sourceId: number, params: QueryParams, teamId: number, signal?: AbortSignal) => {
     if (!teamId) {
       throw new Error("Team ID is required for querying logs");
     }
+    
+    // Extract timeout from params and convert to axios options
+    const timeout = params.query_timeout || 30; // Default to 30 seconds
+    
     return apiClient.post<QueryResponse>(
       `/teams/${teamId}/sources/${sourceId}/logs/query`,
-      params
+      params,
+      { timeout, signal }
     );
   },
 
-  getHistogramData: (sourceId: number, params: QueryParams, teamId: number) => {
+  getHistogramData: (sourceId: number, params: QueryParams, teamId: number, signal?: AbortSignal) => {
     if (!teamId) {
       throw new Error("Team ID is required for getting histogram data");
     }
@@ -137,9 +162,13 @@ export const exploreApi = {
       delete histogramParams.group_by;
     }
 
+    // Extract timeout from params
+    const timeout = params.query_timeout || 30; // Default to 30 seconds
+
     return apiClient.post<HistogramResponse>(
       `/teams/${teamId}/sources/${sourceId}/logs/histogram`,
-      histogramParams
+      histogramParams,
+      { timeout, signal }
     );
   },
 
@@ -150,6 +179,35 @@ export const exploreApi = {
     return apiClient.post<LogContextResponse>(
       `/teams/${teamId}/sources/${sourceId}/logs/context`,
       params
+    );
+  },
+
+  generateAISQL: (sourceId: number, params: AIGenerateSQLRequest, teamId: number) => {
+    if (!teamId) {
+      throw new Error("Team ID is required for AI SQL generation");
+    }
+    if (!sourceId) {
+      throw new Error("Source ID is required for AI SQL generation");
+    }
+    return apiClient.post<AIGenerateSQLResponse>(
+      `/teams/${teamId}/sources/${sourceId}/generate-sql`,
+      params
+    );
+  },
+
+  cancelQuery: (sourceId: number, queryId: string, teamId: number) => {
+    if (!teamId) {
+      throw new Error("Team ID is required for cancelling queries");
+    }
+    if (!sourceId) {
+      throw new Error("Source ID is required for cancelling queries");
+    }
+    if (!queryId) {
+      throw new Error("Query ID is required for cancelling queries");
+    }
+    return apiClient.post<{message: string; query_id: string}>(
+      `/teams/${teamId}/sources/${sourceId}/logs/query/${queryId}/cancel`,
+      {}
     );
   }
 };

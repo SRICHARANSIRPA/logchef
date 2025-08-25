@@ -11,10 +11,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mr-karan/logchef/internal/metrics"
 	"github.com/mr-karan/logchef/pkg/models"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+)
+
+// Default values for query execution
+const (
+	// DefaultQueryTimeout is the default max_execution_time in seconds if not specified
+	DefaultQueryTimeout = 60
+	// MaxQueryTimeout is the maximum allowed timeout to prevent resource abuse
+	MaxQueryTimeout = 300 // 5 minutes
 )
 
 // Client represents a connection to a ClickHouse database using the native protocol.
@@ -25,6 +34,9 @@ type Client struct {
 	queryHooks []QueryHook         // Hooks to execute before/after queries.
 	mu         sync.Mutex          // Protects shared resources within the client if any
 	opts       *clickhouse.Options // Stores connection options for reconnection
+	sourceID   string              // Source ID for metrics tracking
+	source     *models.Source      // Source model for metrics with meaningful labels
+	metrics    *metrics.ClickHouseMetrics
 }
 
 // ClientOptions holds configuration for establishing a new ClickHouse client connection.
@@ -34,6 +46,8 @@ type ClientOptions struct {
 	Username string                 // Username for authentication.
 	Password string                 // Password for authentication.
 	Settings map[string]interface{} // Additional ClickHouse settings (e.g., max_execution_time).
+	SourceID string                 // Source ID for metrics tracking.
+	Source   *models.Source         // Source model for enhanced metrics.
 }
 
 // ExtendedColumnInfo provides detailed column metadata, including nullability,
@@ -111,10 +125,18 @@ func NewClient(opts ClientOptions, logger *slog.Logger) (*Client, error) {
 		logger:     logger,
 		queryHooks: []QueryHook{}, // Initialize hooks slice.
 		opts:       options,
+		sourceID:   opts.SourceID,
+		source:     opts.Source,
 	}
 
 	// Apply a default hook for basic query logging.
 	client.AddQueryHook(NewLogQueryHook(logger, false)) // Verbose logging disabled by default.
+
+	// Add metrics hook if source is provided
+	if opts.Source != nil {
+		client.AddQueryHook(metrics.NewMetricsQueryHook(opts.Source))
+		client.metrics = metrics.NewClickHouseMetrics(opts.Source)
+	}
 
 	return client, nil
 }
@@ -157,20 +179,40 @@ func (c *Client) executeQueryWithHooks(ctx context.Context, query string, fn fun
 // It automatically handles DDL statements by calling execDDL.
 // The params argument is now unused but kept for potential future structured query building.
 func (c *Client) Query(ctx context.Context, query string /* params LogQueryParams - Removed */) (*models.QueryResult, error) {
+	return c.QueryWithTimeout(ctx, query, nil)
+}
+
+// QueryWithTimeout executes a SELECT query with a timeout setting.
+// The timeoutSeconds parameter is required and will always be applied.
+func (c *Client) QueryWithTimeout(ctx context.Context, query string, timeoutSeconds *int) (*models.QueryResult, error) {
 	start := time.Now()          // Used for calculating total duration including hook overhead.
 	queryStartTime := time.Now() // Separate timer for actual DB execution
 	var queryDuration time.Duration
+
+	// Start query metrics tracking
+	var queryHelper *metrics.QueryMetricsHelper
+	if c.metrics != nil {
+		queryType := metrics.DetermineQueryType(query)
+		queryHelper = c.metrics.StartQuery(queryType, nil) // User context not available in client
+	}
+
+	// Ensure timeout is provided (should always be the case now)
+	if timeoutSeconds == nil {
+		defaultTimeout := DefaultQueryTimeout
+		timeoutSeconds = &defaultTimeout
+	}
 
 	defer func() {
 		c.logger.Debug("query processing complete",
 			"duration_ms", time.Since(start).Milliseconds(),
 			"query_length", len(query),
+			"timeout_seconds", *timeoutSeconds,
 		)
 	}()
 
 	// Delegate DDL statements (CREATE, ALTER, DROP, etc.) to execDDL.
 	if isDDLStatement(query) {
-		return c.execDDL(ctx, query)
+		return c.execDDLWithTimeout(ctx, query, timeoutSeconds)
 	}
 
 	var rows driver.Rows
@@ -181,19 +223,24 @@ func (c *Client) Query(ctx context.Context, query string /* params LogQueryParam
 	err := c.executeQueryWithHooks(ctx, query, func(hookCtx context.Context) error {
 		var queryErr error
 		queryStartTime = time.Now() // Reset timer before execution
+
+		// Always apply timeout setting
+		hookCtx = clickhouse.Context(hookCtx, clickhouse.WithSettings(clickhouse.Settings{
+			"max_execution_time": *timeoutSeconds,
+		}))
+		c.logger.Debug("applying query timeout", "timeout_seconds", *timeoutSeconds)
+
 		rows, queryErr = c.conn.Query(hookCtx, query)
-		// Defer rows.Close() here. We are abandoning getting accurate stats from the driver for now.
-		if rows != nil { // Only defer close if rows is not nil
-			defer func() {
-				// Closing might return an error, potentially overriding queryErr
-				// Consider how to handle this if needed, for now, we prioritize queryErr
-				// closeErr := rows.Close()
-				rows.Close()
-			}()
-		}
 		if queryErr != nil {
-			return queryErr // Return error to be logged by AfterQuery hook.
+			return queryErr
 		}
+
+		// Close rows when we're done processing them
+		defer func() {
+			if rows != nil {
+				rows.Close()
+			}
+		}()
 
 		// Get column names and types.
 		columnTypes := rows.ColumnTypes()
@@ -228,6 +275,18 @@ func (c *Client) Query(ctx context.Context, query string /* params LogQueryParam
 		return rows.Err()
 	})
 
+	// Complete metrics tracking
+	if queryHelper != nil {
+		success := err == nil
+		rowsReturned := int64(-1)
+		if success && resultData != nil {
+			rowsReturned = int64(len(resultData))
+		}
+		errorType := metrics.DetermineErrorType(err)
+		timedOut := false // TODO: better timeout detection
+		queryHelper.Finish(success, rowsReturned, errorType, timedOut)
+	}
+
 	// Handle errors from either query execution or row processing.
 	if err != nil {
 		return nil, fmt.Errorf("executing query or processing results: %w", err)
@@ -250,8 +309,27 @@ func (c *Client) Query(ctx context.Context, query string /* params LogQueryParam
 // execDDL executes a DDL statement (e.g., CREATE, ALTER, DROP) using hooks.
 // It returns an empty QueryResult on success.
 func (c *Client) execDDL(ctx context.Context, query string) (*models.QueryResult, error) {
+	return c.execDDLWithTimeout(ctx, query, nil)
+}
+
+// execDDLWithTimeout executes a DDL statement with a timeout setting.
+// The timeoutSeconds parameter is required and will always be applied.
+func (c *Client) execDDLWithTimeout(ctx context.Context, query string, timeoutSeconds *int) (*models.QueryResult, error) {
 	start := time.Now()
+
+	// Ensure timeout is provided (should always be the case now)
+	if timeoutSeconds == nil {
+		defaultTimeout := DefaultQueryTimeout
+		timeoutSeconds = &defaultTimeout
+	}
+
 	err := c.executeQueryWithHooks(ctx, query, func(hookCtx context.Context) error {
+		// Always apply timeout setting
+		hookCtx = clickhouse.Context(hookCtx, clickhouse.WithSettings(clickhouse.Settings{
+			"max_execution_time": *timeoutSeconds,
+		}))
+		c.logger.Debug("applying DDL query timeout", "timeout_seconds", *timeoutSeconds)
+
 		return c.conn.Exec(hookCtx, query)
 	})
 
@@ -317,6 +395,14 @@ func (c *Client) Reconnect(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	success := false
+	defer func() {
+		if c.metrics != nil {
+			c.metrics.RecordReconnection(success)
+			c.metrics.UpdateConnectionStatus(success)
+		}
+	}()
+
 	// Only attempt reconnect if connection exists but is failing
 	if c.conn != nil {
 		// Try to close the existing connection first with a timeout
@@ -373,6 +459,7 @@ func (c *Client) Reconnect(ctx context.Context) error {
 
 	// Replace the connection
 	c.conn = newConn
+	success = true
 	c.logger.Info("successfully reconnected to clickhouse")
 	return nil
 }
@@ -763,6 +850,9 @@ func isKeyword(s string) bool {
 // It uses short timeouts internally. Returns nil on success, or an error indicating the failure reason.
 func (c *Client) Ping(ctx context.Context, database string, table string) error {
 	if c.conn == nil {
+		if c.metrics != nil {
+			c.metrics.RecordConnectionValidation(false)
+		}
 		return errors.New("clickhouse connection is nil")
 	}
 
@@ -771,6 +861,11 @@ func (c *Client) Ping(ctx context.Context, database string, table string) error 
 	defer pingCancel()
 
 	if err := c.conn.Ping(pingCtx); err != nil {
+		if c.metrics != nil {
+			c.metrics.RecordConnectionValidation(false)
+			c.metrics.UpdateConnectionStatus(false)
+		}
+
 		// Check if the error is due to the context deadline exceeding
 		if errors.Is(err, context.DeadlineExceeded) {
 			c.logger.Debug("ping timed out after 1 second")
@@ -781,6 +876,10 @@ func (c *Client) Ping(ctx context.Context, database string, table string) error 
 
 	// 2. If database and table are provided, check table existence.
 	if database == "" || table == "" {
+		if c.metrics != nil {
+			c.metrics.RecordConnectionValidation(true)
+			c.metrics.UpdateConnectionStatus(true)
+		}
 		return nil // Basic ping successful, no table check needed.
 	}
 
@@ -796,6 +895,11 @@ func (c *Client) Ping(ctx context.Context, database string, table string) error 
 	// No need for executeQueryWithHooks here, it's a simple metadata check.
 	err := c.conn.QueryRow(tableCtx, query, database, table).Scan(&exists)
 	if err != nil {
+		if c.metrics != nil {
+			c.metrics.RecordConnectionValidation(false)
+			c.metrics.UpdateConnectionStatus(false)
+		}
+
 		if errors.Is(err, context.DeadlineExceeded) {
 			c.logger.Debug("table check timed out", "database", database, "table", table, "timeout", "1s")
 			return fmt.Errorf("table check timed out for %s.%s: %w", database, table, err)
@@ -815,5 +919,9 @@ func (c *Client) Ping(ctx context.Context, database string, table string) error 
 	}
 
 	// If Scan succeeds without error, the table exists.
+	if c.metrics != nil {
+		c.metrics.RecordConnectionValidation(true)
+		c.metrics.UpdateConnectionStatus(true)
+	}
 	return nil
 }

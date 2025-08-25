@@ -1,13 +1,18 @@
-import { ref, computed } from 'vue'
+import { ref, computed, type Ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useExploreStore } from '@/stores/explore'
 import { useSavedQueriesStore } from '@/stores/savedQueries'
-import { useToast } from '@/components/ui/toast'
+import { useAuthStore } from '@/stores/auth';
+import { useTeamsStore } from '@/stores/teams'; // Corrected path
+import { useVariableStore } from '@/stores/variables'
+import { useToast } from '@/composables/useToast'
 import { TOAST_DURATION } from '@/lib/constants'
 import { getErrorMessage } from '@/api/types'
 import type { SaveQueryFormData } from '@/views/explore/types'
 import type { SavedTeamQuery } from '@/api/savedQueries'
+import type { TeamMember } from '@/api/teams'; // Import TeamMember type
 import { CalendarDateTime, getLocalTimeZone, type DateValue } from '@internationalized/date'
+import type { Source } from "@/api/sources";
 
 // Add this helper function before the useSavedQueries function definition
 function calendarDateTimeToTimestamp(dateTime: DateValue | null | undefined): number | null {
@@ -22,38 +27,82 @@ function calendarDateTimeToTimestamp(dateTime: DateValue | null | undefined): nu
   }
 }
 
-export function useSavedQueries() {
+export function useSavedQueries(
+    queries?: Ref<SavedTeamQuery[] | undefined>,
+    currentSource?: Ref<Source | undefined>
+) {
+  // Create a local queries ref if none is provided
+  const localQueries = ref<SavedTeamQuery[]>([]);
+  // Use provided queries ref or fall back to local one
+  const queriesRef = queries || localQueries;
   const router = useRouter()
   const route = useRoute()
   const exploreStore = useExploreStore()
   const savedQueriesStore = useSavedQueriesStore()
+  const authStore = useAuthStore();
+  const teamsStore = useTeamsStore();
+  const variableStore = useVariableStore();
   const { toast } = useToast()
 
   const showSaveQueryModal = ref(false)
   const editingQuery = ref<SavedTeamQuery | null>(null)
   const isLoading = ref(false)
   const isLoadingQueryDetails = ref(false)
-  const queries = ref<SavedTeamQuery[]>([])
   const searchQuery = ref('')
 
-  // Computed for filtered queries based on search
-  const filteredQueries = computed(() => {
-    if (!searchQuery.value.trim()) {
-      return queries.value
+  const isEditingExistingQuery = computed(() => !!route.query.collection_id);
+
+  const canManageCollections = computed(() => {
+    if (!authStore.isAuthenticated || !authStore.user) {
+      return false;
+    }
+    // Global admins can always manage collections
+    if (authStore.user.role === "admin") {
+      return true;
     }
 
-    const search = searchQuery.value.toLowerCase()
-    return queries.value.filter(query =>
-      query.name.toLowerCase().includes(search) ||
-      (query.description && query.description.toLowerCase().includes(search))
-    )
-  })
+    const teamIdParam = route.query.team;
+    if (!teamIdParam) {
+      // If no team context, disallow (or decide default behavior)
+      return false;
+    }
+    const teamId = Number(teamIdParam);
+    if (isNaN(teamId)) {
+      return false;
+    }
 
-  // Has queries computed property
-  const hasQueries = computed(() => filteredQueries.value.length > 0)
+    // Use the new getter from teamsStore
+    const userRoleInTeam = teamsStore.getUserRoleInTeam(teamId);
+
+    // Allow if user is team admin or team editor for the current team
+    return userRoleInTeam === "admin" || userRoleInTeam === "editor";
+  });
+
+  // This is the primary computed property for displaying queries after filtering.
+  // It uses queriesRef (which is either the passed in queries or our local fallback)
+  const filteredQueries = computed(() => {
+    if (!searchQuery.value.trim()) {
+      return queriesRef.value;
+    }
+
+    const search = searchQuery.value.toLowerCase();
+    return queriesRef.value?.filter(query =>
+        query.name.toLowerCase().includes(search) ||
+        (query.description && query.description.toLowerCase().includes(search))
+    );
+  });
+
+  // Has queries computed property, uses the above filteredQueries
+  const hasQueries = computed(() => {
+    // Ensure filteredQueries.value exists before accessing its length
+    return filteredQueries.value ? filteredQueries.value.length > 0 : false;
+  });
 
   // Total query count
-  const totalQueryCount = computed(() => queries.value.length)
+  const totalQueryCount = computed(() => {
+    // Ensure queriesRef.value exists before accessing its length
+    return queriesRef.value ? queriesRef.value.length : 0;
+  });
 
   // Clear search function
   function clearSearch() {
@@ -63,8 +112,8 @@ export function useSavedQueries() {
   // Save query modal trigger
   async function handleSaveQueryClick() {
     const query = exploreStore.activeMode === 'logchefql'
-      ? exploreStore.logchefqlCode
-      : exploreStore.rawSql
+        ? exploreStore.logchefqlCode
+        : exploreStore.rawSql
 
     if (!query?.trim()) {
       toast({
@@ -97,19 +146,19 @@ export function useSavedQueries() {
         isLoadingQueryDetails.value = true
         // Fetch query details from the backend
         const result = await savedQueriesStore.fetchTeamSourceQueries(
-          parseInt(teamId),
-          parseInt(sourceId)
+            parseInt(teamId),
+            parseInt(sourceId)
         )
 
         if (result.success && savedQueriesStore.queries) {
           // Find the specific query from the results (or maybe the store state?)
           const foundQuery = savedQueriesStore.queries.find(q => q.id.toString() === queryId);
           if (foundQuery) {
-             editingQuery.value = foundQuery;
-             showSaveQueryModal.value = true;
+            editingQuery.value = foundQuery;
+            showSaveQueryModal.value = true;
           } else {
-             // If not found after fetch, maybe it was deleted? Or fetch didn't return it?
-             throw new Error(`Query details for ID ${queryId} not found after fetch.`);
+            // If not found after fetch, maybe it was deleted? Or fetch didn't return it?
+            throw new Error(`Query details for ID ${queryId} not found after fetch.`);
           }
         } else {
           throw new Error(result.error?.message || 'Failed to load query details')
@@ -148,26 +197,26 @@ export function useSavedQueries() {
       }
 
       if (isUpdate && queryId) {
-         // Ensure source ID is present for update
-         if (!formData.source_id) {
-            throw new Error("Missing source ID for update operation");
-         }
+        // Ensure source ID is present for update
+        if (!formData.source_id) {
+          throw new Error("Missing source ID for update operation");
+        }
 
-         // Use the correct store action for updates
-         console.log(`useSavedQueries.handleSaveQuery: Updating query ${queryId} for team ${formData.team_id}, source ${formData.source_id}`);
-         response = await savedQueriesStore.updateTeamSourceQuery(
+        // Use the correct store action for updates
+        console.log(`useSavedQueries.handleSaveQuery: Updating query ${queryId} for team ${formData.team_id}, source ${formData.source_id}`);
+        response = await savedQueriesStore.updateTeamSourceQuery(
             formData.team_id,
             formData.source_id, // Pass source ID
             queryId,
             {
-               // Payload includes only relevant fields for updateTeamSourceQuery
-               name: formData.name,
-               description: formData.description,
-               query_type: formData.query_type,
-               query_content: formData.query_content
+              // Payload includes only relevant fields for updateTeamSourceQuery
+              name: formData.name,
+              description: formData.description,
+              query_type: formData.query_type,
+              query_content: formData.query_content
             }
-         );
-         console.log('Updated query via updateTeamSourceQuery:', response);
+        );
+        console.log('Updated query via updateTeamSourceQuery:', response);
 
       } else {
         // --- Create or Overwrite Flow ---
@@ -179,30 +228,30 @@ export function useSavedQueries() {
         // Check for existing query by name/team/source (potential overwrite)
         const existingQueries = savedQueriesStore.data.queries || [];
         const existingQuery = existingQueries.find(q =>
-          q.name === formData.name &&
-          q.team_id === formData.team_id &&
-          q.source_id === formData.source_id
+            q.name === formData.name &&
+            q.team_id === formData.team_id &&
+            q.source_id === formData.source_id
         );
 
         if (existingQuery) {
           // Ask for confirmation before overwriting
           const confirmOverwrite = window.confirm(
-            `A query named "${formData.name}" already exists for this source. Do you want to overwrite it?`
+              `A query named "${formData.name}" already exists for this source. Do you want to overwrite it?`
           );
 
           if (confirmOverwrite) {
             // Overwrite existing using updateTeamSourceQuery
             console.log(`useSavedQueries.handleSaveQuery: Overwriting query ${existingQuery.id} for team ${formData.team_id}, source ${formData.source_id}`);
             response = await savedQueriesStore.updateTeamSourceQuery(
-              formData.team_id,
-              formData.source_id,
-              existingQuery.id.toString(),
-              {
-                name: formData.name,
-                description: formData.description,
-                query_type: formData.query_type,
-                query_content: formData.query_content
-              }
+                formData.team_id,
+                formData.source_id,
+                existingQuery.id.toString(),
+                {
+                  name: formData.name,
+                  description: formData.description,
+                  query_type: formData.query_type,
+                  query_content: formData.query_content
+                }
             );
             console.log('Overwrote existing query via updateTeamSourceQuery:', response);
           } else {
@@ -216,19 +265,19 @@ export function useSavedQueries() {
           // We need to parse the formData.query_content first if it's a string here
           let parsedContent;
           try {
-              parsedContent = JSON.parse(formData.query_content);
+            parsedContent = JSON.parse(formData.query_content);
           } catch (e) {
-              console.error("Failed to parse formData.query_content before create:", e);
-              throw new Error("Invalid query content format for create operation");
+            console.error("Failed to parse formData.query_content before create:", e);
+            throw new Error("Invalid query content format for create operation");
           }
 
           response = await savedQueriesStore.createSourceQuery(
-            formData.team_id,
-            formData.source_id,
-            formData.name,
-            formData.description,
-            parsedContent, // Pass the parsed content object
-            formData.query_type // Add the query_type parameter
+              formData.team_id,
+              formData.source_id,
+              formData.name,
+              formData.description,
+              parsedContent, // Pass the parsed content object
+              formData.query_type // Add the query_type parameter
           );
           console.log('Created new query via createSourceQuery:', response);
         }
@@ -257,7 +306,7 @@ export function useSavedQueries() {
 
         // Ensure queries are refreshed for the current source
         if (formData.team_id && formData.source_id) {
-           await loadSourceQueries(formData.team_id, formData.source_id);
+          await loadSourceQueries(formData.team_id, formData.source_id);
         }
 
         toast({
@@ -347,27 +396,29 @@ export function useSavedQueries() {
           if (!isNaN(startDate.getTime()) && !isNaN(endDate.getTime())) {
             // Create CalendarDateTime objects
             const startDateTime = new CalendarDateTime(
-              startDate.getFullYear(),
-              startDate.getMonth() + 1,
-              startDate.getDate(),
-              startDate.getHours(),
-              startDate.getMinutes(),
-              startDate.getSeconds()
+                startDate.getFullYear(),
+                startDate.getMonth() + 1,
+                startDate.getDate(),
+                startDate.getHours(),
+                startDate.getMinutes(),
+                startDate.getSeconds()
             );
 
             const endDateTime = new CalendarDateTime(
-              endDate.getFullYear(),
-              endDate.getMonth() + 1,
-              endDate.getDate(),
-              endDate.getHours(),
-              endDate.getMinutes(),
-              endDate.getSeconds()
+                endDate.getFullYear(),
+                endDate.getMonth() + 1,
+                endDate.getDate(),
+                endDate.getHours(),
+                endDate.getMinutes(),
+                endDate.getSeconds()
             );
 
             // Set the time range in the store
-            exploreStore.setTimeRange({
-              start: startDateTime,
-              end: endDateTime
+            exploreStore.setTimeConfiguration({
+              absoluteRange: {
+                start: startDateTime,
+                end: endDateTime
+              }
             });
           } else {
             console.warn("Invalid timestamp in saved query timeRange, keeping current range");
@@ -380,6 +431,19 @@ export function useSavedQueries() {
         // Keep existing time range from the store
       }
 
+      // save variable data into store.
+      if (Array.isArray(content.variables)) {
+        try {
+          variableStore.setAllVariable(content.variables);
+          console.log("Restored variables from saved query.");
+        } catch (e) {
+          console.error("Failed to restore variables from saved query:", e);
+        }
+      } else {
+        console.warn("No valid variables found in saved query.");
+      }
+
+
       // Set the selected query ID in the store
       exploreStore.setSelectedQueryId(queryData.id.toString());
 
@@ -390,7 +454,7 @@ export function useSavedQueries() {
 
       // CENTRALIZED URL HANDLING: Create URL query parameters directly
       // This ensures consistency between dropdown and saved queries view
-      const queryParams = { ...route.query }; // Start with current params
+      const queryParams: Record<string, string> = {};
 
       // Always include these critical parameters for proper state tracking
       queryParams.team = queryData.team_id.toString();
@@ -401,8 +465,9 @@ export function useSavedQueries() {
       const startTime = calendarDateTimeToTimestamp(exploreStore.timeRange?.start);
       const endTime = calendarDateTimeToTimestamp(exploreStore.timeRange?.end);
       if (startTime !== null && endTime !== null) {
-        queryParams.start_time = startTime.toString();
-        queryParams.end_time = endTime.toString();
+        // Use canonical keys expected by explorer
+        queryParams.start = startTime.toString();
+        queryParams.end = endTime.toString();
       }
 
       // Set limit from current store state
@@ -411,18 +476,23 @@ export function useSavedQueries() {
       // Set mode and query content
       queryParams.mode = isLogchefQL ? 'logchefql' : 'sql';
       if (queryToLoad) {
-        queryParams.q = encodeURIComponent(queryToLoad);
+        // For SQL mode use `sql`, for logchefql use `q`
+        if (isLogchefQL) {
+          queryParams.q = queryToLoad;
+        } else {
+          queryParams.sql = queryToLoad;
+        }
       }
 
       // Update URL with complete state (replaces syncUrlFromState call)
       console.log("Updating URL with saved query state, including query_id:", queryData.id.toString());
       router.replace({ query: queryParams });
 
-      toast({
-        title: 'Success',
-        description: `Query "${queryData.name}" loaded successfully.`,
-        duration: TOAST_DURATION.SUCCESS
-      })
+      // toast({
+      //   title: 'Success',
+      //   description: `Query "${queryData.name}" loaded successfully.`,
+      //   duration: TOAST_DURATION.SUCCESS
+      // })
 
       // Don't call syncUrlFromState() since we're explicitly setting the URL
 
@@ -473,8 +543,8 @@ export function useSavedQueries() {
       if (queryContent.timeRange !== null &&
           queryContent.timeRange?.absolute?.start &&
           queryContent.timeRange?.absolute?.end) {
-        url += `&start_time=${queryContent.timeRange.absolute.start}`
-        url += `&end_time=${queryContent.timeRange.absolute.end}`
+        url += `&start=${queryContent.timeRange.absolute.start}`
+        url += `&end=${queryContent.timeRange.absolute.end}`
       }
 
       // Add mode parameter based on query type
@@ -482,7 +552,11 @@ export function useSavedQueries() {
 
       // Add the query content (actual query text)
       if (queryContent.content) {
-        url += `&q=${encodeURIComponent(queryContent.content)}`
+        if (queryType === 'logchefql') {
+          url += `&q=${encodeURIComponent(queryContent.content)}`
+        } else {
+          url += `&sql=${encodeURIComponent(queryContent.content)}`
+        }
       }
 
       return url
@@ -570,17 +644,17 @@ export function useSavedQueries() {
 
       if (!teamId || !sourceId) {
         console.warn("No team or source ID provided for loading queries")
-        queries.value = []
+        queriesRef.value = []
         return { success: false, error: 'No team or source ID provided' }
       }
 
       const result = await savedQueriesStore.fetchTeamSourceQueries(teamId, sourceId)
 
       if (result.success) {
-        queries.value = result.data ?? []
+        queriesRef.value = result.data ?? []
         return { success: true, data: result.data }
       } else {
-        queries.value = []
+        queriesRef.value = []
         if (result.error) {
           toast({
             title: 'Error',
@@ -592,7 +666,7 @@ export function useSavedQueries() {
         return { success: false, error: result.error }
       }
     } catch (error) {
-      queries.value = []
+      queriesRef.value = []
       toast({
         title: 'Error',
         description: getErrorMessage(error),
@@ -610,7 +684,8 @@ export function useSavedQueries() {
     console.log("Creating new query in useSavedQueries...");
 
     // Reset the query state to defaults
-    exploreStore.resetQueryStateToDefault();
+    // Use the centralized reset function in the store
+    exploreStore.resetQueryToDefaults();
 
     // Build new query parameters without query_id
     const newQuery: Record<string, string> = {};
@@ -659,65 +734,60 @@ export function useSavedQueries() {
 
   // Local helper to fetch details, now using store action
   async function getQueryDetails(teamId: number, sourceId: number, queryId: string) {
-     console.warn("`getQueryDetails` function in useSavedQueries is deprecated. Use store action directly.");
-     return await savedQueriesStore.fetchTeamSourceQueries(teamId, sourceId);
-     // Note: This fetches *all* queries for the source, not a single one by ID.
-     // The store doesn't seem to have a dedicated action for one source query by ID.
-     // We might need to add one if `fetchTeamSourceQueries` returning a list is inefficient.
+    console.warn("`getQueryDetails` function in useSavedQueries is deprecated. Use store action directly.");
+    return await savedQueriesStore.fetchTeamSourceQueries(teamId, sourceId);
+    // Note: This fetches *all* queries for the source, not a single one by ID.
+    // The store doesn't seem to have a dedicated action for one source query by ID.
+    // We might need to add one if `fetchTeamSourceQueries` returning a list is inefficient.
   }
-
-  // Check if the current query is being edited (has query_id in URL)
-  const isEditingExistingQuery = computed(() => {
-    return !!route.query.query_id
-  })
 
   // Function to update an existing query
   async function updateSavedQuery(
-    teamId: number,
-    sourceId: number,
-    queryId: string,
-    updateData: { // Define the expected update payload shape
-      name?: string;
-      description?: string;
-      query_content: string; // Content is required for update here
-      query_type: 'logchefql' | 'sql'; // Type is required
-    }
+      teamId: number,
+      sourceId: number,
+      queryId: string,
+      updateData: { // Define the expected update payload shape
+        name?: string;
+        description?: string;
+        query_content: string; // Content is required for update here
+        query_type: 'logchefql' | 'sql'; // Type is required
+      }
   ) {
-     console.log(`useSavedQueries: Updating query ${queryId} for team ${teamId}, source ${sourceId}`);
-     isLoading.value = true;
-     try {
-       const payload = {
-          name: updateData.name, // Pass along if provided
-          description: updateData.description, // Pass along if provided
-          query_content: updateData.query_content,
-          query_type: updateData.query_type,
-       };
+    console.log(`useSavedQueries: Updating query ${queryId} for team ${teamId}, source ${sourceId}`);
+    isLoading.value = true;
+    try {
+      const payload = {
+        name: updateData.name, // Pass along if provided
+        description: updateData.description, // Pass along if provided
+        query_content: updateData.query_content,
+        query_type: updateData.query_type,
+      };
 
-       // Call the specific store action for updating a team-source query
-       const result = await savedQueriesStore.updateTeamSourceQuery(teamId, sourceId, queryId, payload);
+      // Call the specific store action for updating a team-source query
+      const result = await savedQueriesStore.updateTeamSourceQuery(teamId, sourceId, queryId, payload);
 
-       if (result.success) {
-          console.log(`useSavedQueries: Query ${queryId} updated successfully.`);
-          // No need to manually update local 'queries' ref here,
-          // as the store action already updates the store's query list.
-          // The component using the store should react to the store change.
-          return { success: true, data: result.data };
-       } else {
-         throw new Error(result.error?.message || 'Failed to update query in store action');
-       }
-     } catch (error) {
-       console.error(`Error updating saved query ${queryId}:`, error);
-       toast({
-         title: 'Update Failed',
-         description: getErrorMessage(error),
-         variant: 'destructive',
-         duration: TOAST_DURATION.ERROR
-       });
-       // Rethrow or return error indicator
-       throw error; // Rethrow to allow caller to handle
-     } finally {
-       isLoading.value = false;
-     }
+      if (result.success) {
+        console.log(`useSavedQueries: Query ${queryId} updated successfully.`);
+        // No need to manually update local 'queries' ref here,
+        // as the store action already updates the store's query list.
+        // The component using the store should react to the store change.
+        return { success: true, data: result.data };
+      } else {
+        throw new Error(result.error?.message || 'Failed to update query in store action');
+      }
+    } catch (error) {
+      console.error(`Error updating saved query ${queryId}:`, error);
+      toast({
+        title: 'Update Failed',
+        description: getErrorMessage(error),
+        variant: 'destructive',
+        duration: TOAST_DURATION.ERROR
+      });
+      // Rethrow or return error indicator
+      throw error; // Rethrow to allow caller to handle
+    } finally {
+      isLoading.value = false;
+    }
   }
 
   return {
@@ -726,12 +796,13 @@ export function useSavedQueries() {
     editingQuery,
     isLoading,
     isLoadingQueryDetails,
-    queries,
+    queries: queriesRef, // Return the queriesRef instead of direct parameter
     filteredQueries,
     hasQueries,
     totalQueryCount,
     searchQuery,
     isEditingExistingQuery,
+    canManageCollections,
 
     // Functions
     handleSaveQueryClick,

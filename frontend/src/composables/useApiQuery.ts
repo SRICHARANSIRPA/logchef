@@ -23,16 +23,17 @@ export function useApiQuery<T>() {
     
     try {
       const response = await apiCall();
-      if (response.status === "success") {
-        // Use null-coalescing with optional default
+
+      if (response && response.status === "success") {
+        // Standard API response format with status and data fields
         const resultData = response.data ?? options?.defaultData ?? null;
         data.value = resultData;
-        
+
         if (options?.successMessage && options?.showToast !== false) {
           showSuccessToast(options.successMessage);
         }
-        
-        // Pass null-safe data to success handler
+
+        // Pass data to success handler
         options?.onSuccess?.(resultData);
         return { success: true, data: resultData };
       } else {
@@ -45,6 +46,14 @@ export function useApiQuery<T>() {
         return { success: false, error: response as APIErrorResponse };
       }
     } catch (err) {
+      // Handle AbortError (user-initiated cancellation) gracefully
+      if (err instanceof Error && err.name === 'AbortError') {
+        console.log('Query aborted by user - this is expected');
+        // Don't treat user-initiated aborts as operational errors
+        // Don't show error toast or call onError handler for cancellations
+        return { success: false, error: null, aborted: true };
+      }
+
       // Handle unexpected errors
       error.value = err as APIErrorResponse;
       if (options?.showToast !== false) {

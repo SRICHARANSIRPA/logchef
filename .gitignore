@@ -30,6 +30,7 @@ go.work.sum
 .cursorrules
 .cursor/
 CLAUDE.md
+DEVELOPMENT_GOALS.md
 
 # Local dev files
 *.db*
@@ -44,3 +45,4 @@ docs/node_modules/*
 
 dist/*
 .DS_Store
+**/.claude/settings.local.json
